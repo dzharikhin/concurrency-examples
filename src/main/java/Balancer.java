@@ -3,7 +3,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -37,8 +36,7 @@ public class Balancer {
       try {
         for (int i = 0; i < servers.size(); i++) {
           Server server = servers.get(i);
-          Map.Entry<Float, Float> load = server.getLoad();
-          Weight weight = new Weight(load.getValue(), load.getKey());
+          Weight weight = new Weight(server.getLoad());
           if ((minIndex < 0 || minWeight.compareTo(weight) > 0)) {
             minIndex = i;
             minWeight = weight;
@@ -81,11 +79,11 @@ public class Balancer {
       this.weight = weight;
     }
 
-    public Map.Entry<Float, Float> getLoad() {
+    public float getLoad() {
       int statsValue = stats.intValue();
       int statRequests = extractStatRequests(statsValue);
       int currentRequests = statsValue & 0xFFFF;
-      return Map.entry((float) statRequests / weight, (float) currentRequests / weight);
+      return (float) (statRequests + currentRequests) / weight;
     }
 
     float getStatLoad() {
@@ -130,21 +128,15 @@ public class Balancer {
   }
 
   private static class Weight implements Comparable<Weight> {
-    private static final Comparator<Weight> CMP = Comparator.comparingDouble(Weight::getCurrent).thenComparingDouble(Weight::getStat);
-    private final float current;
-    private final float stat;
+    private static final Comparator<Weight> CMP = Comparator.comparingDouble(Weight::getLoad);
+    private final float load;
 
-    public Weight(float current, float stat) {
-      this.current = current;
-      this.stat = stat;
+    public Weight(float load) {
+      this.load = load;
     }
 
-    public float getCurrent() {
-      return current;
-    }
-
-    public float getStat() {
-      return stat;
+    public float getLoad() {
+      return load;
     }
 
     @Override
