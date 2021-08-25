@@ -18,6 +18,7 @@ import java.util.stream.IntStream;
 
 public class Balancer {
 
+  //TODO stamped lock
   private static final ReadWriteLock lock = new ReentrantReadWriteLock();
   private static final Lock readLock = lock.readLock();
   private static final Lock writeLock = lock.writeLock();
@@ -61,15 +62,13 @@ public class Balancer {
 
   private static void release(int index, List<Server> servers) {
     servers.get(index).release();
-    boolean needRescale;
     writeLock.lock();
     try {
-      needRescale = servers.stream().allMatch(server -> server.getStatLoad() > 1);
+      if (servers.stream().allMatch(server -> server.getStatLoad() > 1)) {
+        servers.forEach(Server::rescale);
+      }
     } finally {
       writeLock.unlock();
-    }
-    if (needRescale) {
-      servers.forEach(Server::rescale);
     }
   }
 
