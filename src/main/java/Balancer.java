@@ -37,10 +37,10 @@ public class Balancer {
             minWeight = weight;
           }
         }
-        servers.get(minIndex).acquire();
       } finally {
         lock.unlockWrite(stamp);
       }
+      servers.get(minIndex).acquire();
       // actual work with server
       Thread.sleep(10);
       counter.computeIfAbsent(minIndex, ign -> new CopyOnWriteArrayList<>()).add(1);
@@ -63,13 +63,15 @@ public class Balancer {
 
   private static void release(int index, List<Server> servers) {
     servers.get(index).release();
+    boolean needToRescale;
     long stamp = optimisticWrite();
     try {
-      if (servers.stream().allMatch(server -> server.getStatLoad() > 1)) {
-        servers.forEach(Server::rescale);
-      }
+      needToRescale = servers.stream().allMatch(server -> server.getStatLoad() > 1);
     } finally {
       lock.unlockWrite(stamp);
+    }
+    if (needToRescale) {
+      servers.forEach(Server::rescale);
     }
   }
 
@@ -94,11 +96,21 @@ public class Balancer {
     }
 
     void acquire() {
-      stats.addAndGet(packValueToStatRequests(1) + 1);
+      long stamp = lock.readLock();
+      try {
+        stats.addAndGet(packValueToStatRequests(1) + 1);
+      } finally {
+        lock.unlock(stamp);
+      }
     }
 
     void rescale() {
-      stats.updateAndGet(currentValue -> extractStatRequests(currentValue) >= weight ? currentValue - packValueToStatRequests(weight) : currentValue);
+      long stamp = lock.readLock();
+      try {
+        stats.updateAndGet(currentValue -> extractStatRequests(currentValue) >= weight ? currentValue - packValueToStatRequests(weight) : currentValue);
+      } finally {
+        lock.unlock(stamp);
+      }
     }
 
     void release() {
