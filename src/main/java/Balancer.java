@@ -9,18 +9,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.StampedLock;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 public class Balancer {
 
-  //TODO stamped lock
-  private static final ReadWriteLock lock = new ReentrantReadWriteLock();
-  private static final Lock readLock = lock.readLock();
-  private static final Lock writeLock = lock.writeLock();
+  private static final StampedLock lock = new StampedLock();
 
   public static void main(String[] args) throws InterruptedException {
     Clock clock = Clock.systemDefaultZone();
@@ -32,7 +27,7 @@ public class Balancer {
       int minIndex = -1;
       Weight minWeight = null;
       //here we need to freeze all servers stats - so we use write lock for read
-      writeLock.lock();
+      long stamp = optimisticWrite();
       try {
         for (int i = 0; i < servers.size(); i++) {
           Server server = servers.get(i);
@@ -44,7 +39,7 @@ public class Balancer {
         }
         servers.get(minIndex).acquire();
       } finally {
-        writeLock.unlock();
+        lock.unlockWrite(stamp);
       }
       // actual work with server
       Thread.sleep(10);
@@ -58,15 +53,23 @@ public class Balancer {
     executorService.shutdown();
   }
 
+  private static long optimisticWrite() {
+    long stamp = lock.tryWriteLock();
+    if (stamp == 0) {
+      stamp = lock.writeLock();
+    }
+    return stamp;
+  }
+
   private static void release(int index, List<Server> servers) {
     servers.get(index).release();
-    writeLock.lock();
+    long stamp = optimisticWrite();
     try {
       if (servers.stream().allMatch(server -> server.getStatLoad() > 1)) {
         servers.forEach(Server::rescale);
       }
     } finally {
-      writeLock.unlock();
+      lock.unlockWrite(stamp);
     }
   }
 
@@ -91,30 +94,19 @@ public class Balancer {
     }
 
     void acquire() {
-      // we don't need atomicity by lock here - just locking on global stat manipulations
-      readLock.lock();
-      try {
-        stats.addAndGet(packValueToStatRequests(1) + 1);
-      } finally {
-        readLock.unlock();
-      }
+      stats.addAndGet(packValueToStatRequests(1) + 1);
     }
 
     void rescale() {
-      readLock.lock();
-      try {
-        stats.updateAndGet(currentValue -> extractStatRequests(currentValue) >= weight ? currentValue - packValueToStatRequests(weight) : currentValue);
-      } finally {
-        readLock.unlock();
-      }
+      stats.updateAndGet(currentValue -> extractStatRequests(currentValue) >= weight ? currentValue - packValueToStatRequests(weight) : currentValue);
     }
 
     void release() {
-      readLock.lock();
+      long stamp = lock.readLock();
       try {
         stats.updateAndGet(i -> i > 0 ? i - 1 : i);
       } finally {
-        readLock.unlock();
+        lock.unlock(stamp);
       }
     }
 
