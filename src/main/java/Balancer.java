@@ -8,14 +8,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.StampedLock;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 public class Balancer {
 
-  private static final StampedLock lock = new StampedLock();
+  private static final AtomicBoolean changeBarrier = new AtomicBoolean();
 
   public static void main(String[] args) throws InterruptedException {
     Clock clock = Clock.systemDefaultZone();
@@ -27,7 +27,7 @@ public class Balancer {
       int minIndex = -1;
       Weight minWeight = null;
       //here we need to freeze all servers stats - so we use write lock for read
-      long stamp = optimisticWrite();
+      lockBarrier();
       try {
         for (int i = 0; i < servers.size(); i++) {
           Server server = servers.get(i);
@@ -37,10 +37,10 @@ public class Balancer {
             minWeight = weight;
           }
         }
+        servers.get(minIndex).acquire();
       } finally {
-        lock.unlockWrite(stamp);
+        unlockBarrier();
       }
-      servers.get(minIndex).acquire();
       // actual work with server
       Thread.sleep(10);
       counter.computeIfAbsent(minIndex, ign -> new CopyOnWriteArrayList<>()).add(1);
@@ -53,22 +53,14 @@ public class Balancer {
     executorService.shutdown();
   }
 
-  private static long optimisticWrite() {
-    long stamp = lock.tryWriteLock();
-    if (stamp == 0) {
-      stamp = lock.writeLock();
-    }
-    return stamp;
-  }
-
   private static void release(int index, List<Server> servers) {
     servers.get(index).release();
     boolean needToRescale;
-    long stamp = optimisticWrite();
+    lockBarrier();
     try {
       needToRescale = servers.stream().allMatch(server -> server.getStatLoad() > 1);
     } finally {
-      lock.unlockWrite(stamp);
+      unlockBarrier();
     }
     if (needToRescale) {
       servers.forEach(Server::rescale);
@@ -87,7 +79,7 @@ public class Balancer {
     public float getLoad() {
       int statsValue = stats.intValue();
       int statRequests = extractStatRequests(statsValue);
-      int currentRequests = statsValue & 0xFFFF;
+      int currentRequests = extractCurrentRequests(statsValue);
       return (float) (statRequests + currentRequests) / weight;
     }
 
@@ -96,34 +88,37 @@ public class Balancer {
     }
 
     void acquire() {
-      long stamp = lock.readLock();
-      try {
-        stats.addAndGet(packValueToStatRequests(1) + 1);
-      } finally {
-        lock.unlock(stamp);
-      }
+      stats.addAndGet(packValueToStatRequests(1) + 1);
     }
 
     void rescale() {
-      long stamp = lock.readLock();
-      try {
-        stats.updateAndGet(currentValue -> extractStatRequests(currentValue) >= weight ? currentValue - packValueToStatRequests(weight) : currentValue);
-      } finally {
-        lock.unlock(stamp);
-      }
+      stats.updateAndGet(currentValue -> {
+        int statRequests = extractStatRequests(currentValue);
+        if (statRequests < weight) {
+          return currentValue;
+        }
+        int currentRequests = extractCurrentRequests(currentValue);
+        checkBarrier();
+        if (statRequests >= 32_767) {
+          return packValueToStatRequests(statRequests % weight) + currentRequests;
+        }
+        return packValueToStatRequests(statRequests - weight) + currentRequests;
+      });
     }
 
     void release() {
-      long stamp = lock.readLock();
-      try {
-        stats.updateAndGet(i -> i > 0 ? i - 1 : i);
-      } finally {
-        lock.unlock(stamp);
-      }
+      stats.updateAndGet(i -> {
+        checkBarrier();
+        return i > 0 ? i - 1 : i;
+      });
     }
 
     private int extractStatRequests(int value) {
-      return value >>> 16;
+      return value >> 16;
+    }
+
+    private int extractCurrentRequests(int value) {
+      return value & 0xFFFF;
     }
 
     private int packValueToStatRequests(int value) {
@@ -146,6 +141,24 @@ public class Balancer {
     @Override
     public int compareTo(Weight o) {
       return CMP.compare(this, o);
+    }
+  }
+
+  private static void lockBarrier() {
+    while (!changeBarrier.compareAndSet(false, true)) {
+      Thread.onSpinWait();
+    }
+  }
+
+  private static void unlockBarrier() {
+    while (!changeBarrier.compareAndSet(true, false)) {
+      Thread.onSpinWait();
+    }
+  }
+
+  private static void checkBarrier() {
+    while (changeBarrier.get()) {
+      Thread.onSpinWait();
     }
   }
 }
